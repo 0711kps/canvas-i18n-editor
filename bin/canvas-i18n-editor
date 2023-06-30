@@ -1,0 +1,181 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "zlib"
+require "optparse"
+require "fileutils"
+require "json"
+
+Options = Struct.new(:translate_from, :translate_to, :mode, :apply_js)
+
+LOCALE_FILE = "config/locales/zh-Hant.yml"
+JS_LOCALE_FILE = "public/javascripts/translations/zh-Hant.json"
+TMP_FILE = "/tmp/canvas-i18n"
+
+# index = 4, skip 4 lines to translation body
+def update_rails_i18n(args)
+  raw_key = args.translate_from
+  # find key in config/locales/zh-Hant.yml
+  data = File.readlines(LOCALE_FILE)
+  keywords = raw_key.split(".")
+  get_layer = -> { _1.match(/^\s*/)[0].size / 2 }
+  current_layer = 1
+  found_key_count = 0
+  updated_flag = false
+  File.open(TMP_FILE, "w:UTF-8") do |file|
+    data[0..3].each { file.write(_1) }
+    (4..data.size - 1).each do |line_index|
+      line = data[line_index]
+      next_line = data[line_index + 1]
+      current_layer = get_layer[line]
+      if !updated_flag && current_layer == found_key_count + 1
+        if line.match?(/^\s{#{current_layer * 2}}#{keywords[0]}:/)
+          line_number = line_index + 1
+          key = keywords.shift
+          found_key_count += 1
+          puts "find #{key} in line #{line_number}"
+          # find last key, should update content now
+          if keywords.empty?
+            line = line.sub(/#{key}:\s?/, "#{key}: ").sub(/(?<=#{key}:\s).+/, "\"#{args.translate_to}\"")
+            updated_flag = true
+          end
+        elsif keywords.join(".") != raw_key && (line_index >= data.size - 1 || get_layer[next_line] < current_layer)
+          # there's at least one key found and reach last line in this scope
+          update_nested_key(file, keywords, current_layer, args)
+          updated_flag = true
+        end
+      end
+
+      file.write(line)
+    end
+
+    unless updated_flag
+      update_nested_key(file, keywords, current_layer, args)
+    end
+    file.close
+  end
+  FileUtils.mv(TMP_FILE, LOCALE_FILE)
+  update_js(raw_key, args.translate_to, args.apply_js)
+end
+
+def update_nested_key(file, keywords, current_layer, args)
+  keywords[0..-2].each do |key|
+    file.write("#{" " * 2 * current_layer}#{key}: \n")
+    current_layer += 1
+  end
+  file.write("#{" " * 2 * current_layer}#{keywords[-1]}: #{args.translate_to}\n")
+end
+
+def update_js(key, translate_to, apply_js)
+  add_js_key unless File.exist?(JS_LOCALE_FILE)
+  data = File.read(JS_LOCALE_FILE)
+  key_part = data.match(/(?<="#{key}":)"[^"]+"/)
+  if key_part
+    data = data.sub(key_part[0], "\"#{translate_to}\"")
+    puts "update js translations"
+    File.write(JS_LOCALE_FILE, data)
+  else
+    add_js_key
+  end
+
+  generate_hashed_js if apply_js
+end
+
+def add_js_key
+  puts "regenerate js translations"
+  `bundle exec rails i18n:generate_js`
+end
+
+def generate_hashed_js
+  `rm public/dist/javascripts/translations/zh-Hant-*.json`
+  puts "generate scoped js translations"
+  `bundle exec rails js:gulp_rev`
+end
+
+def update_canvas_i18n(args)
+  hash = Zlib.crc32("#{args.translate_from.size}:#{args.translate_from}").to_s(16)
+  prefix = args.translate_from.downcase[0,50].gsub(/[\s\-\/_:]{1,}/, "_").gsub(/[^a-zA-Z0-9_-]/, "")
+  key = "#{prefix}_#{hash}"
+  updated_flag = false
+  # find key in config/locales/zh-Hant.yml
+  File.open(TMP_FILE, "w:UTF-8") do |file|
+    File.readlines(LOCALE_FILE).each_with_index do |line, line_index|
+      if !updated_flag && line.match?(/^\s*#{key}:/)
+        line_number = line_index + 1
+        puts "find key in line #{line_number}"
+        line = line.sub(/#{key}:\s?/, "#{key}: ").sub(/(?<=#{key}:\s).+/, "\"#{args.translate_to}\"")
+        updated_flag = true
+      end
+
+      file.write(line)
+    end
+
+    unless updated_flag
+      puts "specified key not found in locale file, create one in last line"
+      file.write("  #{key}: #{args.translate_to}\n")
+    end
+
+    file.close
+  end
+
+  FileUtils.mv(TMP_FILE, LOCALE_FILE)
+  update_js(key, args.translate_to, args.apply_js)
+end
+
+def update_from_content(args)
+  search_keyword = args.translate_from
+  # TODO: use translate_from(means original content here) to search for key(query like %keyword%)
+  # TODO: raise error if there's multiple candidate
+  # TODO: use the key to update yml directly, and get full key if it's rails i18n
+  # TODO: use key(full key) to update_js
+end
+
+def ask_translate_to(translate_from)
+  printf "what's the content you want to translate \"#{translate_from}\" to ? "
+  STDIN.gets
+end
+
+class Parser
+  def self.parse(user_input)
+    user_input.push("-h") if user_input.empty?
+    args = Options.new
+
+    opt_parser = OptionParser.new do |opts|
+      opts.banner = "Usage:
+      canvas-i18n-edit translateFrom translateTo [options]
+
+      canvas-i18n-edit 'Click Me' '點我' # edit i18n using canvas liner-style key
+      canvas-i18n-edit 'controller_name.action_name.click_me' '點我' # edit i18n using rails i18n key
+      "
+
+      opts.on("-a", "--apply", "apply js translations") do
+        args.apply_js = true
+      end
+
+      opts.on("-h", "--help", "Prints this help") do
+        puts opts
+        exit
+      end
+    end
+
+    opt_parser.parse!(user_input) # options are remove after this line
+
+    args.translate_from = user_input[0].strip
+    args.translate_to = (user_input[1] || ask_translate_to(args.translate_from)).strip
+    args.mode = if args.translate_from.match?(/([a-zA-Z]+\.)+[a-zA-Z]+/)
+                  :rails
+                else
+                  :canvas
+                end
+
+    args
+  end
+end
+
+args = Parser.parse(ARGV)
+case args.mode
+in :rails
+  update_rails_i18n(args)
+in :canvas
+  update_canvas_i18n(args)
+end
